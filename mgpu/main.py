@@ -63,6 +63,7 @@ def run(proc_id, n_gpus, devices):
     th.manual_seed(1234)
     np.random.seed(1234)
     th.cuda.manual_seed_all(1234)
+    dgl.random.seed(1234)
 
     dev_id = devices[proc_id]
     if n_gpus > 1:
@@ -97,28 +98,26 @@ def run(proc_id, n_gpus, devices):
     # number of neighbors to sample
     num_neighbors = 4
     # number of epochs
-    num_epochs = 1
+    num_epochs = 10
 
     model = GCNSampling(in_feats, n_hidden, n_classes, L, F.relu, dropout)
     model = model.to(dev_id)
     loss_fcn = nn.CrossEntropyLoss()
     loss_fcn = loss_fcn.to(dev_id)
     optimizer = optim.Adam(model.parameters(), lr=0.03)
-    sampler = dgl.contrib.sampling.NeighborSampler(g, batch_size / n_gpus, num_neighbors,
-                                                   neighbor_type='in', shuffle=True, num_hops=L, seed_nodes=train_nid)
+    sampler = dgl.contrib.sampling.NeighborSampler(g, batch_size, num_neighbors,
+                                                   neighbor_type='in', shuffle=True, num_hops=L, seed_nodes=train_nid, num_workers=1)
 
-    total_step = 128
-    th.cuda.synchronize()
+    avg = 0
     for epoch in range(num_epochs):
         i = 0
-        start = True
+        elapsed_time = 0
         for step, nf in enumerate(sampler):
-            if start:
-                if n_gpus > 1:
-                    th.distributed.barrier()
-                tic = time.time() 
-                start = False
             nf.copy_from_parent()
+            th.cuda.synchronize()
+            tic = time.time() 
+            if n_gpus > 1:
+                th.distributed.barrier()
             # forward
             pred = model(nf)
             batch_nids = nf.layer_parent_nid(-1).to(dev_id)
@@ -134,14 +133,23 @@ def run(proc_id, n_gpus, devices):
                         th.distributed.all_reduce(param.grad.data,
                                                   op=th.distributed.ReduceOp.SUM)
                         param.grad.data /= n_gpus
+            if n_gpus > 1:
+                th.distributed.barrier()
             optimizer.step()
-            if step % 10 == 0 and proc_id == 0:
+            toc = time.time()
+            elapsed_time += toc - tic
+            if step % 50 == 0 and proc_id == 0:
                 print('epoch{} step {}: loss {}'.format(epoch, step, loss.item()))
-            if step + 1 == total_step:
-                break
         if n_gpus > 1:
             th.distributed.barrier()
-        if proc_id == 0: print('epoch time: ', time.time() - tic)
+        if proc_id == 0: print('epoch time: ', elapsed_time)
+        if epoch >= 5:
+            avg += elapsed_time
+
+    if n_gpus > 1:
+        th.distributed.barrier()
+    if proc_id == 0:
+        print('avg time: {}'.format(avg / (epoch - 4)))
 
 if __name__ == '__main__':
     argparser = argparse.ArgumentParser("multi-gpu training")
