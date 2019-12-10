@@ -59,11 +59,11 @@ class GCNSampling(nn.Module):
         return h
 
 
-def run(proc_id, n_gpus, devices):
+def run(proc_id, n_gpus, args, devices):
     th.manual_seed(1234)
     np.random.seed(1234)
     th.cuda.manual_seed_all(1234)
-    dgl.random.seed(1234)
+    # dgl.random.seed(1234)
 
     dev_id = devices[proc_id]
     if n_gpus > 1:
@@ -76,16 +76,18 @@ def run(proc_id, n_gpus, devices):
                                           world_size=world_size,
                                           rank=dev_id)
 
+
+    th.set_num_threads(args.num_workers * 2 if args.prefetch else args.num_workers)
     data = RedditDataset(self_loop=True)
     train_nid = th.LongTensor(np.nonzero(data.train_mask)[0])
     features = th.Tensor(data.features)
 
     in_feats = features.shape[1]
-    labels = th.LongTensor(data.labels).to(dev_id)
+    labels = th.LongTensor(data.labels)
     n_classes = data.num_labels
 
     g = dgl.DGLGraph(data.graph, readonly=True)
-    g.ndata['features'] = features.to(dev_id)
+    g.ndata['features'] = features
 
     # number of GCN layers
     L = 2
@@ -98,7 +100,7 @@ def run(proc_id, n_gpus, devices):
     # number of neighbors to sample
     num_neighbors = 4
     # number of epochs
-    num_epochs = 10
+    num_epochs = 20
 
     model = GCNSampling(in_feats, n_hidden, n_classes, L, F.relu, dropout)
     model = model.to(dev_id)
@@ -106,22 +108,21 @@ def run(proc_id, n_gpus, devices):
     loss_fcn = loss_fcn.to(dev_id)
     optimizer = optim.Adam(model.parameters(), lr=0.03)
     sampler = dgl.contrib.sampling.NeighborSampler(g, batch_size, num_neighbors,
-                                                   neighbor_type='in', shuffle=True, num_hops=L, seed_nodes=train_nid, num_workers=1)
+                                                   neighbor_type='in', shuffle=True, num_hops=L, seed_nodes=train_nid, num_workers=args.num_workers)
+    th.cuda.synchronize()
 
     avg = 0
     for epoch in range(num_epochs):
         i = 0
-        elapsed_time = 0
+        tic = time.time()
         for step, nf in enumerate(sampler):
             nf.copy_from_parent()
-            th.cuda.synchronize()
-            tic = time.time() 
-            if n_gpus > 1:
-                th.distributed.barrier()
+            nf.layers[0].data['features'] =\
+                nf.layers[0].data['features'].to(dev_id)
             # forward
             pred = model(nf)
             batch_nids = nf.layer_parent_nid(-1).to(dev_id)
-            batch_labels = labels[batch_nids]
+            batch_labels = labels[batch_nids].to(dev_id)
             # compute loss
             loss = loss_fcn(pred, batch_labels)
             # backward
@@ -136,30 +137,31 @@ def run(proc_id, n_gpus, devices):
             if n_gpus > 1:
                 th.distributed.barrier()
             optimizer.step()
-            toc = time.time()
-            elapsed_time += toc - tic
             if step % 50 == 0 and proc_id == 0:
                 print('epoch{} step {}: loss {}'.format(epoch, step, loss.item()))
         if n_gpus > 1:
             th.distributed.barrier()
-        if proc_id == 0: print('epoch time: ', elapsed_time)
-        if epoch >= 5:
-            avg += elapsed_time
+        toc = time.time()
+        if proc_id == 0: print('epoch time: ', toc - tic)
+        if epoch >= 10:
+            avg += toc - tic
 
     if n_gpus > 1:
         th.distributed.barrier()
     if proc_id == 0:
-        print('avg time: {}'.format(avg / (epoch - 4)))
+        print('avg time: {}'.format(avg / (epoch - 9)))
 
 if __name__ == '__main__':
     argparser = argparse.ArgumentParser("multi-gpu training")
     argparser.add_argument('--gpu', type=str, default='0')
+    argparser.add_argument('--num-workers', type=int, default=1)
+    argparser.add_argument('--prefetch', action='store_true')
     args = argparser.parse_args()
     
     devices = list(map(int, args.gpu.split(',')))
     n_gpus = len(devices)
     if n_gpus == 1:
-        run(0, n_gpus, devices)
+        run(0, n_gpus, args, devices)
     else:
         mp = th.multiprocessing
-        mp.spawn(run, args=(n_gpus, devices), nprocs=n_gpus)
+        mp.spawn(run, args=(n_gpus, args, devices), nprocs=n_gpus)
